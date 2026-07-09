@@ -13,11 +13,11 @@ Each item is upserted independently using the same semantics as [Update by Exter
   See [Authentication](/api-reference/introduction) for details.
 </Note>
 
-## Partial Success Semantics
+## Atomic Semantics
 
-The endpoint returns **`207 Multi-Status`** when the batch is accepted, even if some items inside fail. Each item carries its own `status` (`ok` or `error`) — you must iterate the response array to check per-item results.
+The batch is applied **atomically** — it either fully succeeds or nothing is written. If any item fails validation, or the database write fails, **no** setups are persisted. On success the endpoint returns **`200 OK`** with the full list of upserted setups.
 
-Request-level errors (empty batch, more than 100 items, duplicate `external_id` within the batch, missing `external_id` on any item) reject the **entire** batch with `400 Bad Request`. No items are written.
+Because the batch is all-or-nothing, there are no per-item status flags: every item in the response was written successfully. Failures are surfaced as a single request-level error (`400` or `500`) identifying the first offending item.
 
 ## Request Body
 
@@ -61,48 +61,46 @@ curl -X POST https://api.traceloop.com/v2/auto-monitor-setups/bulk \
 
 ## Response
 
-### 207 Multi-Status
+### 200 OK
 
-Returned when the batch is accepted. The `setups` array contains one entry per input item, in the **same order** as the request.
-
-Each entry has:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `external_id` | string | The `external_id` of the input item. |
-| `status` | string | `ok` if the item was upserted, `error` if it failed. |
-| `result` | object | Present when `status` is `ok`. The full upserted setup, matching the [Create](/api-reference/auto-monitor-setups/create-an-auto-monitor-setup) response shape. |
-| `error` | string | Present when `status` is `error`. Human-readable message prefixed with the item index, e.g. `setups[1]: unknown evaluator slug "..."`. Internal errors are reported as `setups[N]: internal error` — the underlying cause is logged server-side but not returned to the client. |
+Returned when the entire batch is upserted successfully. The `setups` array contains one entry per input item, in the **same order** as the request. Each entry is a full setup object, matching the [Create](/api-reference/auto-monitor-setups/create-an-auto-monitor-setup) response shape.
 
 ```json
 {
   "setups": [
     {
+      "id": "cmm...",
       "external_id": "openai-gpt4o-monitor",
-      "status": "ok",
-      "result": {
-        "id": "cmm...",
-        "external_id": "openai-gpt4o-monitor",
-        "org_id": "c108269c-...",
-        "project_id": "cm9v2g95l...",
-        "env_project_id": "cm9v2ga9i...",
-        "init_rules": [
-          { "key": "gen_ai.system", "value": "openai", "source": "span_attributes", "operator": "equals" },
-          { "key": "gen_ai.request.model", "value": "gpt-4o", "source": "span_attributes", "operator": "equals" }
-        ],
-        "evaluators": [
-          { "evaluator_type": "answer-relevancy", "status": "pending" },
-          { "evaluator_type": "toxicity-detector", "status": "pending" }
-        ],
-        "status": "pending",
-        "created_at": "2026-05-20T10:30:00Z",
-        "updated_at": "2026-05-20T10:30:00Z"
-      }
+      "org_id": "c108269c-...",
+      "project_id": "cm9v2g95l...",
+      "env_project_id": "cm9v2ga9i...",
+      "init_rules": [
+        { "key": "gen_ai.system", "value": "openai", "source": "span_attributes", "operator": "equals" },
+        { "key": "gen_ai.request.model", "value": "gpt-4o", "source": "span_attributes", "operator": "equals" }
+      ],
+      "evaluators": [
+        { "evaluator_type": "answer-relevancy", "status": "pending" },
+        { "evaluator_type": "toxicity-detector", "status": "pending" }
+      ],
+      "status": "pending",
+      "created_at": "2026-05-20T10:30:00Z",
+      "updated_at": "2026-05-20T10:30:00Z"
     },
     {
+      "id": "cmm...",
       "external_id": "anthropic-monitor",
-      "status": "error",
-      "error": "setups[1]: unknown evaluator slug \"answer-relevancy-typo\""
+      "org_id": "c108269c-...",
+      "project_id": "cm9v2g95l...",
+      "env_project_id": "cm9v2ga9i...",
+      "init_rules": [
+        { "key": "gen_ai.system", "value": "anthropic", "source": "span_attributes", "operator": "equals" }
+      ],
+      "evaluators": [
+        { "evaluator_type": "answer-relevancy", "status": "pending" }
+      ],
+      "status": "pending",
+      "created_at": "2026-05-20T10:30:00Z",
+      "updated_at": "2026-05-20T10:30:00Z"
     }
   ]
 }
@@ -110,12 +108,13 @@ Each entry has:
 
 ### 400 Bad Request
 
-Returned when the batch is rejected without writing any items. Causes:
+Returned when the batch is rejected without writing any items. The `error` message identifies the first offending item by index. Causes:
 
-- Empty `setups` array
-- More than 100 items
-- Any item missing `external_id`
-- Two items in the batch share the same `external_id`
+- Empty `setups` array — `setups must contain at least 1 item`
+- More than 100 items — `setups exceeds max of 100`
+- Any item missing `external_id` — `setups[N]: external_id is required`
+- Two items in the batch share the same `external_id` — `setups[N]: duplicate external_id "..." (also at setups[M])`
+- Any item fails validation — e.g. an unknown evaluator slug, an invalid selector, or an invalid evaluator config, prefixed with the item index: `setups[N]: evaluators[0]: unknown evaluator slug "..."`
 
 ```json
 {
@@ -125,8 +124,10 @@ Returned when the batch is rejected without writing any items. Causes:
 
 ### 500 Internal Server Error
 
+Returned when the database write fails. No items are persisted. The underlying cause is logged server-side and not returned to the client.
+
 ```json
 {
-  "error": "internal server error"
+  "error": "Internal server error"
 }
 ```
